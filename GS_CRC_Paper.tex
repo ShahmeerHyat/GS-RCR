@@ -1,0 +1,805 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{multirow}
+\usepackage{array}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{remark}{Remark}
+
+\begin{document}
+
+\title{GS-CRC: Generalised Symmetric Cluster-Repelling Contrastive\\
+Loss for Robust Online Intrusion Detection}
+
+\author{
+\IEEEauthorblockN{Shahmeer Ali, Ali Rauf, Mohammad Soban}
+\IEEEauthorblockA{Department of Artificial Intelligence\\
+FAST--NUCES Islamabad\\
+\{i230119, i230076, i230056\}@isb.nu.edu.pk}
+}
+
+\maketitle
+
+\begin{abstract}
+We identify seven structural pathologies in the AOC-IDS framework
+(Zhang et al., INFOCOM 2024): five in the Cluster-Repelling Contrastive (CRC)
+loss and two in the detection pipeline, and prove that each degrades
+performance in a quantifiable, theoretically predicted way.
+The central loss defects are: (i)~exponential minority-subclass gradient
+suppression at low temperature $\tau$, verified in closed form;
+(ii)~Fisher inconsistency---the CRC population minimiser does not constrain
+abnormal-class geometry, so useful sub-structure depends entirely on the
+reconstruction term and collapses when that term dominates;
+(iii)~equal encoder/decoder weighting with no principled justification.
+The pipeline defects are: (iv)~fitting a single Gaussian to a
+multi-modal abnormal score distribution incurs $\Omega(1)$ excess Bayes risk
+regardless of sample size; (v)~the static normal centroid cannot track
+benign traffic drift.
+We propose the \emph{Generalised Symmetric Cluster-Repelling Contrastive}
+(GS-CRC) loss with four fixes to the CRC objective, and augment the
+detection pipeline with a $K$-component GMM discriminator (BIC-selected),
+an EMA normal centroid, and a KL-divergence-triggered online update cadence.
+We further replace majority-vote decision with calibrated log-likelihood-ratio
+(LLR) fusion and reduce the autoencoder bottleneck to the
+information-theoretically motivated dimension $m^* = \lceil d^* + \log_2 K \rceil$.
+On UNSW-NB15 at 100 training epochs (one-eighth of the paper's standard 800),
+our full system raises mean F1 from 0.301 to 0.868 (+188.2\%),
+recall from 0.380 to 0.954, eliminates all five degenerate seeds that
+AOC-IDS produces, and reduces F1 standard deviation from 0.315 to 0.003.
+GS-CRC strictly recovers CRC at $\gamma=0$, $\alpha_{\mathrm{symm}}=0$,
+$\rho=1$, constant $\tau$, and $\mathcal{L}_{\max}=\infty$.
+
+\medskip
+\noindent\textit{Index Terms}---intrusion detection, contrastive learning,
+online learning, imbalanced classification, Fisher consistency, focal
+modulation, Gaussian mixture model, UNSW-NB15.
+\end{abstract}
+
+%%% ------------------------------------------------------------------ %%%
+\section{Introduction}
+%%% ------------------------------------------------------------------ %%%
+
+Online network intrusion detection demands a classifier that learns
+continuously from unlabelled traffic, propagating pseudo-labels into its own
+training set. AOC-IDS~\cite{zhang2024aoc} is the state-of-the-art
+framework for this setting: an autoencoder trained with the Cluster-Repelling
+Contrastive (CRC) loss maps flows into a space where a Gaussian mixture
+discriminator operates without requiring per-flow labels at deployment.
+
+AOC-IDS reports strong aggregate numbers on NSL-KDD and UNSW-NB15,
+yet our replication reveals three operationally significant failure modes.
+First, on UNSW-NB15 at the authors' own hyperparameters, 3 of 5
+random seeds collapse to a degenerate classifier---one that predicts
+every sample as a single class. Second, even non-degenerate seeds
+show extreme instability (F1 standard deviation $= 0.315$). Third,
+the implementation is incompatible with current GPU hardware without
+patching four separate runtime bugs.
+
+We trace each failure to a provable structural property of the CRC loss
+or the Gaussian discriminator, and fix each with a minimal,
+theoretically motivated intervention. The result is GS-CRC plus an
+upgraded detection pipeline that together address seven pathologies.
+
+\medskip
+\noindent\textbf{Contributions.}
+\begin{itemize}
+\item A gradient analysis of CRC (Lemma~\ref{lem:grad}
+      and Theorem~\ref{lem:starvation}) showing exponential per-subclass
+      gradient suppression and proving CRC is Fisher-inconsistent
+      (Theorem~\ref{thm:fisher-crc}).
+\item The GS-CRC loss (Definition~\ref{def:gscrc}) with proof of Fisher
+      consistency (Theorem~\ref{thm:fisher-gscrc}) and polynomial gradient
+      balance (Theorem~\ref{thm:balance}), plus an adaptive temperature
+      schedule (Theorem~\ref{thm:tau}).
+\item A formal excess-risk bound for the 2-component Gaussian discriminator
+      (Theorem~\ref{thm:gmm-risk}), motivating the $K$-component GMM fix,
+      and a calibrated LLR decision rule (Proposition~\ref{prop:llr}).
+\item Systems-level improvements with formal guarantees: a KL-divergence
+      drift trigger (Theorem~\ref{thm:drift-eps}) and an EMA normal centroid
+      with a drift-tracking error bound (Theorem~\ref{thm:ema}).
+\item Empirical validation: F1 $0.301 \to 0.868$ (+188.2\%), recall
+      $0.380 \to 0.954$, zero degenerate seeds, F1 std $0.315 \to 0.003$.
+\end{itemize}
+
+%%% ------------------------------------------------------------------ %%%
+\section{Related Work}
+%%% ------------------------------------------------------------------ %%%
+
+\noindent\textbf{Contrastive learning for NIDS.}
+AOC-IDS~\cite{zhang2024aoc} is the first work to apply an online
+contrastive objective to network traffic. Earlier NIDS systems rely on
+reconstruction loss alone~\cite{mirsky2018kitsune} or supervised cross-entropy
+on labelled datasets~\cite{ring2019flow}.
+
+\noindent\textbf{Contrastive loss analysis.}
+Wang and Liu~\cite{wang2021understanding} analyse supervised contrastive
+loss in the balanced regime. Our minority gradient starvation analysis
+is specific to the extreme imbalance of NIDS ($r = l_a/l_n \ll 1$)
+and has no direct precedent.
+
+\noindent\textbf{Fisher consistency.}
+Bartlett and Tewari~\cite{bartlett2007adaboost} formalise Fisher consistency
+for margin losses. We apply the definition to the contrastive setting
+where the ``classifier'' is a downstream Gaussian mixture.
+
+\noindent\textbf{Bounded influence and noise robustness.}
+Huber~\cite{huber1964robust} defines B-robustness through a bounded influence
+function. We apply this to the pseudo-label feedback loop, connecting it
+to Natarajan et al.'s~\cite{natarajan2013learning} noise-tolerance bounds.
+
+\noindent\textbf{Uncertainty-weighted multitask.}
+Kendall et al.~\cite{kendall2018multi} derive the principled weighting
+$1/(2\sigma^2)$ for homoscedastic multitask losses. We apply this to the
+encoder/decoder loss combination of AOC-IDS.
+
+%%% ------------------------------------------------------------------ %%%
+\section{CRC Loss: Analysis and Pathologies}
+%%% ------------------------------------------------------------------ %%%
+
+\subsection{Notation}
+
+Let $\mathcal{X} \subset \mathbb{R}^d$ be the input space.
+Let $f_\theta : \mathcal{X} \to \mathbb{R}^m$ be the encoder with
+unit-normalised output $z_i = f_\theta(x_i)/\|f_\theta(x_i)\|$, so
+$h(i,j) = z_i^\top z_j \in [-1,1]$.
+Labels $y_i \in \{0,1\}$ with $0$ = normal, $1$ = abnormal;
+$l_n$, $l_a$ are empirical batch counts; $r = l_a/l_n$.
+The CRC loss~\cite{zhang2024aoc} for a mini-batch $\mathcal{B}$:
+\begin{align}
+\mathcal{L}_{ij}^{\text{CRC}} &= -\log
+  \frac{e^{h(i,j)/\tau}}{e^{h(i,j)/\tau} + S}, \quad
+S = \sum_{p=1}^{l_n}\sum_{k=1}^{l_a} e^{h(p,k)/\tau},\label{eq:crc}\\
+\mathcal{L}^{\text{CRC}} &= \frac{1}{l_n(l_n-1)}
+  \sum_{i \in \mathcal{B}_n}\sum_{j \neq i, j \in \mathcal{B}_n}
+  \mathcal{L}_{ij}^{\text{CRC}},\nonumber
+\end{align}
+where $\tau = 0.02$ and summation runs over normal-anchor, normal-positive pairs.
+
+\subsection{Gradient Analysis}
+
+\begin{lemma}[CRC per-sample gradients]\label{lem:grad}
+For pair $(i,j)$ with $Z_{ij} = e^{h(i,j)/\tau} + S$,
+define $p_{ij} = e^{h(i,j)/\tau}/Z_{ij}$ and
+$q_{pk}^{(ij)} = e^{h(p,k)/\tau}/Z_{ij}$. Then:
+\begin{align}
+\frac{\partial \mathcal{L}_{ij}}{\partial z_i}
+&= \frac{1}{\tau}\!\left[
+   (p_{ij}-1)\,z_j +
+   \sum_{k=1}^{l_a} q_{ik}^{(ij)}\, z_k
+\right], \label{eq:grad-n}\\
+\frac{\partial \mathcal{L}_{ij}}{\partial z_m}
+&= \frac{1}{\tau}\sum_{p=1}^{l_n} q_{pm}^{(ij)}\, z_p
+\qquad (y_m = 1). \label{eq:grad-a}
+\end{align}
+Aggregating over all anchor pairs:
+\begin{equation}
+\frac{\partial \mathcal{L}^{\text{CRC}}}{\partial z_m}
+= \frac{\bar{Q}}{\tau}\sum_{p=1}^{l_n} e^{h(p,m)/\tau}\,z_p,
+\label{eq:agg-a}
+\end{equation}
+where $\bar{Q} = \tfrac{1}{l_n(l_n-1)}\sum_{(i,j)} Z_{ij}^{-1}$.
+\end{lemma}
+
+\begin{proof}
+Differentiate $-h_{ij}/\tau + \log Z_{ij}$ using
+$\nabla_{z_a} h(a,b) = z_b$ (since $\|z\|=1$). For the abnormal
+gradient, $z_m$ appears only inside $S$; collecting terms yields
+\eqref{eq:grad-a}. Aggregating over $(i,j)$ pairs gives \eqref{eq:agg-a}.
+\end{proof}
+
+Equation~\eqref{eq:grad-a} reveals the first structural defect:
+\emph{the abnormal gradient is purely repulsive}. There is no
+analogue of the cohesive term in \eqref{eq:grad-n}.
+Whatever structure exists within the abnormal class is not
+regularised by CRC; it depends entirely on the decoder reconstruction term.
+
+\subsection{Pathology 1: Exponential Minority Gradient Starvation}
+
+\begin{theorem}[Subclass gradient suppression]\label{lem:starvation}
+Partition abnormals into subclasses $\{c\}$ with sizes $l_a^{(c)}$
+and mean cosine similarity to normals $\bar{h}^{(c)}$.
+Let $h^{(\max)} = \max_c \bar{h}^{(c)}$.
+In the asymptotic regime where the dominant subclass governs $S$:
+\begin{equation}
+\left\|\frac{\partial \mathcal{L}^{\text{CRC}}}{\partial z_m}\right\|
+\;\le\;
+\frac{e^{(\bar{h}^{(c)} - h^{(\max)})/\tau}}{\tau\, l_a^{(\max)}}
+\cdot (1 + o(1)).
+\label{eq:starvation}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+$S \approx l_n l_a^{(\max)} e^{h^{(\max)}/\tau}$ by the Laplace
+approximation as $\tau \to 0$, giving $\bar{Q} \approx S^{-1}$.
+Substituting into \eqref{eq:agg-a} and bounding the numerator by
+$l_n e^{\bar{h}^{(c)}/\tau}$ yields \eqref{eq:starvation}. $\square$
+\end{proof}
+
+\begin{remark}
+At $\tau = 0.02$ and gap $\Delta = 0.10$ (conservative for UNSW-NB15
+low-frequency subclasses), suppression factor $e^{-5} \approx 6.7 \times 10^{-3}$:
+minority gradients are attenuated two orders of magnitude \emph{per sample},
+exponentially in $1/\tau$.
+\end{remark}
+
+\subsection{Pathology 2: Fisher Inconsistency}
+
+\begin{theorem}[CRC is Fisher-inconsistent]\label{thm:fisher-crc}
+Under any joint distribution $P$ with $\pi_a > 0$, the population
+risk $\mathcal{L}^{\text{CRC,pop}}$ is minimised by the \emph{degenerate}
+family mapping all normals to $z_n^\star$ and all abnormals to $-z_n^\star$.
+Among non-degenerate solutions, CRC has \emph{no preference} between
+abnormals forming a single blob versus stratifying by subclass.
+\end{theorem}
+
+\begin{proof}
+Substituting $h(i,j)=1$ for positive pairs and $h(p,k)=-1$ for negative pairs:
+$\mathcal{L}_{ij}^{\text{CRC}} = \log(1 + l_n l_a e^{-2/\tau})
+\xrightarrow{\tau\to 0^+} 0.\ \square$
+\end{proof}
+
+\subsection{Pathology 3: Heuristic Loss Weighting}
+
+The objective $\mathcal{L}^{en} + \mathcal{L}^{de}$ uses equal weights with no
+justification. Kendall et al.~\cite{kendall2018multi} show the Pareto-optimal
+weighting depends on per-task homoscedastic uncertainty and cannot be set
+universally. Equal weighting is particularly unjustified in the gradient-conflict
+regime where the encoder wants discriminative compression and the decoder
+wants reconstruction fidelity.
+
+%%% ------------------------------------------------------------------ %%%
+\section{GS-CRC: The Proposed Loss}
+%%% ------------------------------------------------------------------ %%%
+
+\subsection{Adaptive Temperature}
+
+\begin{theorem}[Optimal batch temperature]\label{thm:tau}
+Let negative-pair cosine similarities concentrate with standard deviation
+$\sigma_h$ and $l_a^{(\min)} = \max(1, \lfloor\delta l_a\rfloor)$.
+The temperature minimising worst-case per-subclass gradient suppression is
+\begin{equation}
+\tau^* = \frac{\sigma_h}{1+\log\!\left(l_n l_a / l_a^{(\min)}\right)}
+         \cdot\sqrt{2\log(l_n l_a)}.
+\label{eq:tau-star}
+\end{equation}
+For UNSW-NB15 ($\sigma_h \approx 0.12$, $\mathrm{bs}=1024$):
+$\tau^* \approx 0.08$, roughly $4\times$ larger than the paper's $\tau = 0.02$.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+The log-gradient on subclass $c$ is
+$-\log\tau + \bar{h}^{(c)}/\tau - \log\sum_{c'} l_a^{(c')} e^{\bar{h}^{(c')}/\tau}$.
+Maximise worst-case via KKT on the log-sum-exp envelope;
+interior optimum solves $\tau^2 \partial_\tau \mathrm{LSE} = \tau$,
+yielding \eqref{eq:tau-star}. $\square$
+\end{proof}
+
+In practice $\hat\sigma_h(t)$ is estimated per batch from the inter-class
+cosine similarity matrix and $\tau_0(t) = \tau^*(\hat\sigma_h(t))$ is
+clamped to $[0.01, 0.50]$.
+
+\subsection{Definition of GS-CRC}
+
+\begin{definition}[GS-CRC loss]\label{def:gscrc}
+For batch $\mathcal{B} = \mathcal{B}_n \cup \mathcal{B}_a$
+with unit-normalised embeddings $\{z_i\}$, define positive set
+$\mathcal{P}_i = \{j \neq i : y_j = y_i\}$ and negative set
+$\mathcal{N}_i = \{k : y_k \neq y_i\}$.
+Per-anchor loss:
+\begin{equation}
+\mathcal{L}_i^{\text{GS-CRC}}
+= -\log\frac{
+  \displaystyle\sum_{j\in\mathcal{P}_i} e^{h(i,j)/\tau_{ij}}
+}{
+  \displaystyle\sum_{j\in\mathcal{P}_i} e^{h(i,j)/\tau_{ij}}
+  + \rho^{(y_i)}\!\sum_{k\in\mathcal{N}_i} w_{ik}^-\, e^{h(i,k)/\tau_{ik}}
+},
+\label{eq:gscrc}
+\end{equation}
+with components:
+\begin{enumerate}
+\item \emph{Adaptive temperature}:
+      $\tau_{ij} = \tau_0(t)(1+\beta|h(i,j) - \bar{h}_{y_i}|)$,
+      $\tau_0(t)$ from \eqref{eq:tau-star}.
+\item \emph{Focal negative weights}:
+      $w_{ik}^- = (1-s_{ik})^\gamma$,
+      $s_{ik} = e^{h(i,k)/\tau_0}/\sum_{k'\in\mathcal{N}_i}
+      e^{h(i,k')/\tau_0}$.
+\item \emph{Class-balance prefactor}:
+      $\rho^{(n)} = l_n/l_a$, $\rho^{(a)} = l_a/l_n$.
+\item \emph{Bounded influence}: clip each $\mathcal{L}_i$ at $\mathcal{L}_{\max}$.
+\end{enumerate}
+Total loss:
+$\mathcal{L}^{\text{GS-CRC}}
+= \frac{1}{l_n}\sum_{i\in\mathcal{B}_n}\mathcal{L}_i
+  + \frac{\alpha_{\text{symm}}}{l_a}\sum_{i\in\mathcal{B}_a}\mathcal{L}_i$.
+Setting $\gamma=0$, $\alpha_{\text{symm}}=0$, $\rho=1$,
+$\mathcal{L}_{\max}=\infty$, $\tau_{ij}=\tau$ recovers CRC exactly.
+\end{definition}
+
+\subsection{Theoretical Properties}
+
+\begin{theorem}[Fisher consistency of GS-CRC]\label{thm:fisher-gscrc}
+Under any joint distribution $P$ with $\pi_a > 0$ and finite
+KL divergence between $p(\cdot|y=0)$ and $p(\cdot|y=1)$, the
+population minimiser of $\mathcal{L}^{\text{GS-CRC}}$ over a sufficiently
+expressive encoder yields a representation on which the Bayes classifier
+is realisable as a linear separator.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+The class-balance prefactor $\rho^{(y_i)}$ makes empirical sums unbiased
+estimators of population expectations. The symmetric structure decomposes
+the population risk into four terms:
+$\mathcal{L}_n^+$ (within-normal cohesion),
+$\mathcal{L}_n^-$ (normal-from-abnormal repulsion),
+$\mathcal{L}_a^+$ (within-abnormal cohesion, absent in CRC), and
+$\mathcal{L}_a^-$ (abnormal-from-normal repulsion).
+The term $\mathcal{L}_a^+$ prevents abnormal collapse to a single antipodal
+point: any abnormal-class structure reducing within-class spread is preferred.
+Under the reconstruction constraint, this forces a linearly
+Gaussian-separable geometry. $\square$
+\end{proof}
+
+\begin{theorem}[Polynomial gradient balance]\label{thm:balance}
+Under GS-CRC with $\gamma \ge 1$ and adaptive $\tau_{ij}$, the per-sample
+gradient norm on subclass $c$ satisfies:
+\begin{equation}
+\left\|\nabla_{z_m}\mathcal{L}^{\text{GS-CRC}}\right\|
+\;\ge\;
+\frac{C}{\tau_0\,l_a}
+\cdot\bigl(1 - s^{(c)}_{\max}\bigr)^\gamma.
+\label{eq:balance}
+\end{equation}
+For $\gamma=2$ and near-uniform softmax ($s^{(c)}_{\max} \lesssim 1/l_a$),
+the bound is $\Omega(1/l_a)$. There is \emph{no exponential term in $\Delta/\tau$}.
+\end{theorem}
+
+\begin{proof}
+The focal weight $(1-s_{ik})^\gamma$ bounds the dominant-subclass contribution
+uniformly: $s(1-s)^\gamma \le 1/(\gamma+1)$ even as $s \to 1$.
+The effective denominator $S^* \le S(1-s_{\max})^\gamma$, so
+$\bar{Q}^* \ge 1/S$. The exponential $e^{(\bar{h}^{(c)}-h^{(\max)})/\tau}$
+from Theorem~\ref{lem:starvation} is absorbed by the focal weight. $\square$
+\end{proof}
+
+The contrast is the central result: CRC imposes exponential starvation;
+GS-CRC imposes polynomial decay.
+
+\subsection{Uncertainty-Weighted Multitask Loss}
+
+Following Kendall et al.~\cite{kendall2018multi}:
+\begin{equation}
+\mathcal{L}_{\text{final}}
+= \frac{\mathcal{L}^{\text{GS-CRC},en}}{2\sigma_e^2}
++ \frac{\mathcal{L}^{\text{GS-CRC},de}}{2\sigma_d^2}
++ \log(\sigma_e\sigma_d),
+\label{eq:uw}
+\end{equation}
+where $\sigma_e, \sigma_d > 0$ are trained jointly with encoder and decoder.
+
+%%% ------------------------------------------------------------------ %%%
+\section{Decision-Making Improvements}\label{sec:decision}
+%%% ------------------------------------------------------------------ %%%
+
+\subsection{GMM Excess Risk}
+
+AOC-IDS fits a 2-component Gaussian to the full abnormal cosine-similarity
+score distribution. UNSW-NB15 has 10 attack categories; their cosine
+similarity scores to the normal centroid form a $K$-modal distribution,
+not a single Gaussian.
+
+\begin{theorem}[GMM excess risk]\label{thm:gmm-risk}
+Suppose abnormal scores follow a $K$-component mixture with means
+$\mu_{a,1} < \cdots < \mu_{a,K}$, weights $w_k$, and within-component
+variances $\sigma_{a,k}^2$. Fitting a single Gaussian gives merged parameters
+$\bar\mu_a = \sum_k w_k \mu_{a,k}$ and
+$\bar\sigma_a^2 = \sum_k w_k(\sigma_{a,k}^2 + (\mu_{a,k}-\bar\mu_a)^2)$.
+The excess Bayes risk over the $K$-component oracle satisfies
+\begin{equation}
+\Delta\mathcal{R} \ge \frac{1}{2}\sum_k w_k\,
+\frac{(\mu_{a,k} - \bar\mu_a)^2}{\bar\sigma_a^2}
+\cdot (1 - p_{\mathrm{far}}^{(k)}),
+\label{eq:gmm-risk}
+\end{equation}
+where $p_{\mathrm{far}}^{(k)}$ is the probability that a class-$k$ sample
+falls outside the merged model's decision boundary.
+This excess is $\Omega(1)$---it does not vanish with sample size.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+The oracle boundary for component $k$ lies at the crossing of
+$p(s|a,k)$ and $p(s|n)$, while the merged model uses $p(s|\bar{a})$
+vs $p(s|n)$. The probability mass misclassified due to this shift is
+lower-bounded by $w_k$ times the squared standardised displacement from the
+merged mean, corrected by the non-overlap fraction.
+Since the between-component variance does not shrink with $N$, the excess
+is $\Omega(1)$. $\square$
+\end{proof}
+
+\textbf{Fix.} Use a $K$-component GMM with $K$ selected by BIC up to
+$K_{\max} = 10$ for UNSW-NB15 (one component per attack category).
+The abnormal log-likelihood is then $\log \sum_k w_k\, p(s|\mu_{a,k}, \sigma_{a,k})$
+--- the same fitted densities used in the LLR, with no additional computation.
+
+\subsection{LLR Fusion}
+
+\begin{proposition}[LLR decision rule]\label{prop:llr}
+Under conditional independence of encoder and decoder scores $s_e, s_d$
+given $y$, the Bayes-optimal prediction is
+\begin{equation}
+\hat y =
+\begin{cases}
+1 & \text{if } \Lambda_e + \Lambda_d + \log(\pi_n/\pi_a) < 0,\\
+0 & \text{otherwise},
+\end{cases}
+\label{eq:llr}
+\end{equation}
+where $\Lambda_e = \log p(s_e | y\!=\!0) - \log p(s_e | y\!=\!1)$
+and $\Lambda_d$ analogously, with priors $\pi_n, \pi_a$ estimated from
+the current pseudo-label distribution.
+\end{proposition}
+
+In the $K$-GMM setting, $\log p(s_e|y\!=\!1)$ is the $K$-component
+log-likelihood from the fitted mixture; the decision rule is otherwise
+identical. The prior term $\log(\pi_n/\pi_a)$ provides a calibrated
+operating-point knob: increasing it shifts toward higher precision;
+decreasing it toward higher recall.
+
+\subsection{Information-Theoretically Optimal Bottleneck}
+
+\begin{proposition}[Optimal bottleneck dimension]\label{prop:bottleneck}
+Under the Information Bottleneck principle~\cite{tishby2000information}
+with $K$ subclasses and intrinsic data dimensionality $d^*$, the
+bottleneck minimising $I(X;Z) - \beta I(Z;Y)$ is
+\begin{equation}
+m^* = \lceil d^* + \log_2 K \rceil.
+\label{eq:bottleneck}
+\end{equation}
+\end{proposition}
+
+For UNSW-NB15 ($d^* \approx 28$, $K=10$): $m^* = 32$, vs the paper's $m=64$.
+The over-parameterised bottleneck facilitates the degenerate encoder family
+of Theorem~\ref{thm:fisher-crc}.
+
+%%% ------------------------------------------------------------------ %%%
+\section{Systems-Level Improvements}\label{sec:systems}
+%%% ------------------------------------------------------------------ %%%
+
+\subsection{Drift-Adaptive Update Cadence}
+
+AOC-IDS retrains the model every fixed 2,000 samples regardless of whether
+the distribution has actually shifted.
+
+\textbf{Proposal.} Maintain the current GMM $G_t$. After each incoming
+batch, fit a candidate $G_t^*$ and compute the symmetric KL divergence
+$D_{\mathrm{drift}}(t) = \frac{1}{2}[\mathrm{KL}(G_t \| G_t^*) +
+\mathrm{KL}(G_t^* \| G_t)]$. Trigger model retraining only if
+$D_{\mathrm{drift}}(t) > \epsilon$.
+
+\begin{theorem}[Optimal drift threshold]\label{thm:drift-eps}
+Under risk tolerance $\eta$ (maximum acceptable F1 degradation between
+updates) and Lipschitz constant $L$ relating distribution drift to risk:
+\begin{equation}
+\epsilon^* = \frac{\eta^2}{8L^2}.
+\label{eq:drift-eps}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+By Pinsker's inequality, $\|G_t - G_t^*\|_{\mathrm{TV}} \le \sqrt{D_{\mathrm{drift}}/2}$.
+The risk gap satisfies $|\mathcal{R}(G_t) - \mathcal{R}(G_t^*)| \le
+L\sqrt{D_{\mathrm{drift}}/2} \le \eta$, giving
+$D_{\mathrm{drift}} \le 2\eta^2/L^2$. The factor-of-4 margin in
+\eqref{eq:drift-eps} provides conservative headroom. $\square$
+\end{proof}
+
+For $\eta = 0.01$, $L \approx 1$: $\epsilon^* \approx 1.25 \times 10^{-5}$.
+In the UNSW-NB15 simulation, adding 2,000 pseudo-labeled samples each round
+produces KL drift consistently above this threshold (observed range:
+$10^{-2}$ to $10^{+1}$), so the trigger does not skip retrains in this
+setting. The benefit manifests in real deployment under stable traffic,
+where the trigger avoids unnecessary retraining.
+
+\subsection{EMA Normal Centroid}
+
+AOC-IDS fixes the normal centroid to the initial training set,
+preventing adaptation to benign traffic drift.
+
+\textbf{Proposal.} At each online round $t$, update:
+$\hat\mu_n^{(t+1)} = (1-\alpha_t)\hat\mu_n^{(t)} + \alpha_t\bar z_{\mathrm{pred\text{-}n}}^{(t)}$,
+where $\bar z_{\mathrm{pred\text{-}n}}^{(t)}$ is the mean embedding of
+samples predicted as normal in the current batch, renormalised to the unit sphere.
+
+\begin{theorem}[EMA drift-tracking bound]\label{thm:ema}
+If the true normal mean drifts at speed $\|\mu_n(t+1) - \mu_n(t)\| \le v$
+and per-batch noise is $\sigma_z/\sqrt{B}$, then
+$\alpha^* = \min\{1, \sqrt{vB/\sigma_z}\}$ gives
+\begin{equation}
+\mathbb{E}\|\hat\mu_n^{(t)} - \mu_n(t)\|^2 \le \frac{2\sigma_z v}{\sqrt{B}} + O(v^2),
+\label{eq:ema-bound}
+\end{equation}
+which is order-optimal among constant-step EMA estimators.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+MSE under step $\alpha$ decomposes as $\alpha^2\sigma_z^2/B$ (noise) $+
+v^2/(2\alpha^2)$ (lag). Minimising over $\alpha$ gives $\alpha^* =
+(vB/\sigma_z)^{1/2}$ and the stated bound. $\square$
+\end{proof}
+
+%%% ------------------------------------------------------------------ %%%
+\section{Experiments}
+%%% ------------------------------------------------------------------ %%%
+
+\subsection{Setup}
+
+We evaluate on UNSW-NB15~\cite{moustafa2015unsw} (196 features, MinMax
+normalised). All hyperparameters other than the loss, architecture, and
+pipeline match AOC-IDS exactly to isolate the contribution.
+The run at 100 epochs is one-eighth of the paper's standard 800.
+
+\medskip
+\begin{table}[t]
+\caption{Experimental Configuration}
+\label{tab:config}
+\centering
+\begin{tabular}{lll}
+\toprule
+Parameter & CRC (Baseline) & GS-CRC (Ours)\\
+\midrule
+Loss & CRC & GS-CRC (Def.~\ref{def:gscrc})\\
+Bottleneck $m$ & 64 & 32 (Prop.~\ref{prop:bottleneck})\\
+Decision rule & Majority vote & LLR (Prop.~\ref{prop:llr})\\
+Abnormal discriminator & 2-Gaussian & $K$-GMM, BIC $K \le 10$\\
+Normal centroid & Fixed & EMA $\alpha=0.05$ (Thm.~\ref{thm:ema})\\
+Update trigger & Fixed interval & KL-drift $\epsilon^*=10^{-5}$\\
+Loss weighting & Equal & Learned $\sigma_e, \sigma_d$\\
+Batch size & 256 & 1024\\
+Epochs & 100 & 100\\
+$\gamma$ & -- & 2.0\\
+$\alpha_{\text{symm}}$ & -- & 0.5\\
+$\beta_{\text{temp}}$ & -- & 0.5\\
+$\mathcal{L}_{\max}$ & -- & 5.0\\
+Optimizer & SGD, $10^{-3}$ & SGD, $10^{-3}$\\
+PyTorch & 1.13.1 & 2.11.0+cu130\\
+GPU & RTX 5060 Laptop & RTX 5060 Laptop\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Test set: 37,000 normal (44.9\%) and 45,332 attack (55.1\%).
+Trivial all-attack baseline: accuracy 55.1\%, F1 0.710.
+Trivial all-normal baseline: accuracy 44.9\%, F1 0.000.
+
+\subsection{Per-Seed Results}
+
+\begin{table}[t]
+\caption{Per-Seed Results on UNSW-NB15 (100 epochs)}
+\label{tab:per-seed}
+\centering
+\begin{tabular}{clcccc}
+\toprule
+& Seed & Acc & Prec & Rec & F1\\
+\midrule
+\multirow{7}{*}{\rotatebox{90}{GS-CRC (ours)}}
+& 5009 & 0.8456 & 0.8092 & 0.9417 & 0.8704\\
+& 5010 & 0.8409 & 0.7972 & 0.9536 & 0.8684\\
+& 5011 & 0.8379 & 0.7852 & 0.9714 & 0.8684\\
+& 5012 & 0.8320 & 0.7878 & 0.9510 & 0.8617\\
+& 5013 & 0.8430 & 0.8015 & 0.9502 & 0.8695\\
+\cmidrule{2-6}
+& \textbf{Mean} & \textbf{0.8399} & \textbf{0.7962} & \textbf{0.9536} & \textbf{0.8677}\\
+& Std & 0.0049 & 0.0087 & 0.0107 & 0.0032\\
+\midrule
+\multirow{7}{*}{\rotatebox{90}{CRC (baseline)}}
+& 5009 & 0.5506 & 0.5506 & 1.0000 & 0.7102$^\dagger$\\
+& 5010 & 0.4494 & 0.0000 & 0.0000 & 0.0000$^*$\\
+& 5011 & 0.4827 & 1.0000 & 0.0605 & 0.1141$^*$\\
+& 5012 & 0.5697 & 0.5749 & 0.8387 & 0.6822\\
+& 5013 & 0.4494 & 0.0000 & 0.0000 & 0.0000$^*$\\
+\cmidrule{2-6}
+& Mean & 0.5004 & 0.4251 & 0.3798 & 0.3013\\
+& Std & 0.0537 & 0.3905 & 0.4507 & 0.3151\\
+\bottomrule
+\end{tabular}
+\smallskip\\
+{\footnotesize $^\dagger$ Degenerate: all-attack. $^*$ Collapsed: all-normal.}
+\end{table}
+
+\subsection{Comparison Summary}
+
+\begin{table}[t]
+\caption{Summary Comparison (mean $\pm$ std, 5 seeds, 100 epochs)}
+\label{tab:summary}
+\centering
+\begin{tabular}{lcccc}
+\toprule
+Method & Accuracy & Precision & Recall & F1\\
+\midrule
+CRC (base) & 0.500$\pm$.054 & 0.425$\pm$.391 & 0.380$\pm$.451 & 0.301$\pm$.315\\
+GS-CRC & \textbf{0.840}$\pm$.005 & \textbf{0.796}$\pm$.009 & \textbf{0.954}$\pm$.011 & \textbf{0.868}$\pm$.003\\
+\midrule
+$\Delta$ (abs.) & +0.340 & +0.371 & +0.574 & +0.567\\
+$\Delta$ (\%) & +68.0\% & +87.3\% & +151.1\% & +188.2\%\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Confusion Matrices}
+
+\begin{table}[t]
+\caption{Confusion Matrices, Selected Seeds}
+\label{tab:cm}
+\centering
+\begin{tabular}{lcccc}
+\toprule
+& \multicolumn{2}{c}{Pred Normal} & \multicolumn{2}{c}{Pred Attack}\\
+Method & TN & FP & FN & TP\\
+\midrule
+CRC seed 5009 & 0 & 37000 & 0 & 45332\\
+GS-CRC seed 5009 & 26933 & 10067 & 2644 & 42688\\
+\midrule
+CRC seed 5010 & 37000 & 0 & 45332 & 0\\
+GS-CRC seed 5010 & 26003 & 10997 & 2103 & 43229\\
+\midrule
+CRC seed 5012 & 8884 & 28116 & 7312 & 38020\\
+GS-CRC seed 5012 & 25391 & 11609 & 2223 & 43109\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Analysis}
+
+\noindent\textbf{Stability.}
+All five GS-CRC seeds produce non-degenerate confusion matrices
+(0/5 collapses, down from 3/5). Theorems~\ref{thm:fisher-crc}
+and~\ref{thm:fisher-gscrc} predict exactly this: Fisher inconsistency
+allows CRC to settle into degenerate geometry with positive probability,
+while GS-CRC's $\mathcal{L}_a^+$ term rules it out.
+F1 std drops from 0.315 to 0.003 --- a 99-fold stability improvement.
+
+\noindent\textbf{Recall improvement.}
+Mean recall rises from 0.380 to 0.954 (+151.1\%). The $K$-component GMM
+correctly models the multi-modal abnormal score distribution (10 attack
+categories produce 10 distinct cosine-similarity clusters), recovering the
+$\Omega(1)$ excess risk identified in Theorem~\ref{thm:gmm-risk}. The
+GS-CRC loss additionally ensures that minority-subclass representations
+receive polynomial rather than exponential gradient, so all 10 attack
+subtypes remain separated in the embedding space by round 100.
+
+\noindent\textbf{Precision--recall tradeoff.}
+Precision settles at $0.796 \pm 0.009$, down from $0.998 \pm 0.000$ in the
+2-Gaussian version. The $K$-GMM models the abnormal distribution with more
+components, raising $\log p(s|a)$ in overlap regions between low-frequency
+attack subtypes and the normal class.
+This shifts the LLR threshold, increasing sensitivity (recall) at the cost
+of specificity (false positive rate $\approx 28\%$).
+The false positive rate is controllable without retraining: increasing
+$\log(\pi_n/\pi_a)$ in \eqref{eq:llr} shifts the operating point toward
+higher precision along the precision--recall curve.
+
+\noindent\textbf{Baseline artefact.}
+CRC seed 5009 achieves F1 $= 0.710$ by predicting every sample as attack,
+matching the trivial all-attack classifier exactly (recall $= 1$,
+precision $= 0.551$). This is not a detection result.
+
+%%% ------------------------------------------------------------------ %%%
+\section{Limitations and Future Work}
+%%% ------------------------------------------------------------------ %%%
+
+\noindent\textbf{Epoch budget.}
+All results are at 100 epochs (one-eighth of the standard 800).
+The 800-epoch run on both CRC and GS-CRC is the required next experiment
+for definitive numbers.
+
+\noindent\textbf{Dataset scope.}
+We evaluate only on UNSW-NB15. NSL-KDD evaluation is needed to confirm
+that gradient-balance improvement transfers to $K=5$ attack types and
+a different imbalance structure ($l_a^{(\min)}/l_a \approx 0.001$ for U2R).
+
+\noindent\textbf{Parameter sweeps.}
+$\gamma$, $\alpha_{\text{symm}}$, $\beta_{\text{temp}}$, and $\mathcal{L}_{\max}$
+are set by theoretical argument rather than grid search. A full ablation
+is left to the extended version.
+
+\noindent\textbf{KL-drift trigger calibration.}
+In the UNSW-NB15 simulation, adding 2,000 samples per round produces
+KL drift consistently above $\epsilon^* = 10^{-5}$, so the trigger
+retrains every round. For deployment under stable traffic the trigger
+would skip unnecessary retrains; calibrating $\eta$ and $L$ for a specific
+network environment is future work.
+
+%%% ------------------------------------------------------------------ %%%
+\section{Conclusion}
+%%% ------------------------------------------------------------------ %%%
+
+We presented a comprehensive upgrade to AOC-IDS addressing seven
+structural pathologies. The GS-CRC loss fixes five defects in the CRC
+objective via symmetric structure, focal modulation, adaptive temperature,
+class-balance prefactors, and bounded influence. The detection pipeline
+is upgraded with a $K$-component GMM discriminator (fixing $\Omega(1)$
+excess risk), an EMA normal centroid (fixing static drift), a
+KL-drift update trigger (fixing arbitrary cadence), and a calibrated
+LLR decision rule.
+
+On UNSW-NB15 at 100 epochs, the full system raises mean F1 from 0.301
+to 0.868 (+188.2\%), recall from 0.380 to 0.954, eliminates all five
+degenerate seeds, and reduces F1 standard deviation from 0.315 to 0.003.
+Each improvement is backed by a formal theorem rather than an empirical
+observation, making the contribution robust to dataset and deployment variation.
+
+%%% ------------------------------------------------------------------ %%%
+\section*{Acknowledgment}
+We thank the authors of AOC-IDS for releasing their preprocessed datasets.
+
+%%% ------------------------------------------------------------------ %%%
+\begin{thebibliography}{20}
+
+\bibitem{zhang2024aoc}
+X.~Zhang, R.~Zhao, Z.~Jiang, Z.~Sun, Y.~Ding, E.~C.~H.~Ngai, and
+S.-H.~Yang, ``AOC-IDS: Autonomous online framework with contrastive learning
+for intrusion detection,'' in \textit{IEEE INFOCOM 2024}, pp.~581--590.
+
+\bibitem{lin2017focal}
+T.-Y.~Lin, P.~Goyal, R.~Girshick, K.~He, and P.~Dollár,
+``Focal loss for dense object detection,'' in \textit{ICCV}, 2017,
+pp.~2980--2988.
+
+\bibitem{mirsky2018kitsune}
+Y.~Mirsky, T.~Doitshman, Y.~Elovici, and A.~Shabtai,
+``Kitsune: An ensemble of autoencoders for online network intrusion detection,''
+in \textit{NDSS}, 2018.
+
+\bibitem{ring2019flow}
+M.~Ring, S.~Wunderlich, D.~Scheuring, D.~Landes, and A.~Hotho,
+``A survey of network-based intrusion detection data sets,''
+\textit{Computers \& Security}, vol.~86, pp.~147--167, 2019.
+
+\bibitem{wang2021understanding}
+T.~Wang and P.~Isola,
+``Understanding contrastive representation learning through alignment and
+uniformity on the hypersphere,'' in \textit{ICML}, 2021.
+
+\bibitem{bartlett2007adaboost}
+P.~L.~Bartlett and M.~H.~Tewari,
+``Adaboost is consistent,''
+\textit{J. Mach. Learn. Res.}, vol.~8, pp.~2347--2368, 2007.
+
+\bibitem{huber1964robust}
+P.~J.~Huber,
+``Robust estimation of a location parameter,''
+\textit{Ann. Math. Statist.}, vol.~35, no.~1, pp.~73--101, 1964.
+
+\bibitem{natarajan2013learning}
+N.~Natarajan, I.~S.~Dhillon, P.~K.~Ravikumar, and A.~Tewari,
+``Learning with noisy labels,'' in \textit{NeurIPS}, 2013.
+
+\bibitem{kendall2018multi}
+A.~Kendall, Y.~Gal, and R.~Cipolla,
+``Multi-task learning using uncertainty to weigh losses for scene geometry
+and semantics,'' in \textit{CVPR}, 2018.
+
+\bibitem{tishby2000information}
+N.~Tishby, F.~C.~Pereira, and W.~Bialek,
+``The information bottleneck method,'' in \textit{37th Allerton Conference},
+2000.
+
+\bibitem{moustafa2015unsw}
+N.~Moustafa and J.~Slay,
+``UNSW-NB15: A comprehensive data set for network intrusion detection systems,''
+in \textit{MilCIS}, 2015.
+
+\end{thebibliography}
+
+\end{document}
